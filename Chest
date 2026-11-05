@@ -1,0 +1,664 @@
+name: Build Infinite Chest jar
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Get Fabric template and add the mod
+        run: |
+          git clone --depth 1 https://github.com/FabricMC/fabric-example-mod.git proj
+          cd proj
+          rm -rf src
+          mkdir -p src/main/java/com/example/infinitechest
+          cat > src/main/java/com/example/infinitechest/InfiniteChestBlock.java <<'EOF_0'
+          package com.example.infinitechest;
+
+          import com.mojang.serialization.MapCodec;
+
+          import org.jspecify.annotations.Nullable;
+
+          import net.minecraft.core.BlockPos;
+          import net.minecraft.world.InteractionResult;
+          import net.minecraft.world.entity.player.Player;
+          import net.minecraft.world.level.Level;
+          import net.minecraft.world.level.block.BaseEntityBlock;
+          import net.minecraft.world.level.block.entity.BlockEntity;
+          import net.minecraft.world.level.block.state.BlockState;
+          import net.minecraft.world.phys.BlockHitResult;
+
+          public class InfiniteChestBlock extends BaseEntityBlock {
+          	public static final MapCodec<InfiniteChestBlock> CODEC = simpleCodec(InfiniteChestBlock::new);
+
+          	public InfiniteChestBlock(Properties properties) {
+          		super(properties);
+          	}
+
+          	@Override
+          	protected MapCodec<? extends BaseEntityBlock> codec() {
+          		return CODEC;
+          	}
+
+          	@Override
+          	public @Nullable BlockEntity newBlockEntity(BlockPos pos, BlockState state) {
+          		return new InfiniteChestBlockEntity(pos, state);
+          	}
+
+          	@Override
+          	protected InteractionResult useWithoutItem(BlockState state, Level level, BlockPos pos, Player player,
+          			BlockHitResult hit) {
+          		if (!level.isClientSide() && level.getBlockEntity(pos) instanceof InfiniteChestBlockEntity chest) {
+          			player.openMenu(chest);
+          		}
+          		return InteractionResult.SUCCESS;
+          	}
+          }
+          EOF_0
+          mkdir -p src/main/java/com/example/infinitechest
+          cat > src/main/java/com/example/infinitechest/InfiniteChestBlockEntity.java <<'EOF_1'
+          package com.example.infinitechest;
+
+          import java.util.ArrayList;
+          import java.util.HashMap;
+          import java.util.List;
+          import java.util.Map;
+
+          import com.mojang.serialization.Codec;
+          import com.mojang.serialization.codecs.RecordCodecBuilder;
+
+          import org.jspecify.annotations.Nullable;
+
+          import net.minecraft.core.BlockPos;
+          import net.minecraft.core.component.DataComponentGetter;
+          import net.minecraft.core.component.DataComponentMap;
+          import net.minecraft.network.chat.Component;
+          import net.minecraft.world.MenuProvider;
+          import net.minecraft.world.entity.player.Inventory;
+          import net.minecraft.world.entity.player.Player;
+          import net.minecraft.world.inventory.AbstractContainerMenu;
+          import net.minecraft.world.item.ItemStack;
+          import net.minecraft.world.level.block.entity.BlockEntity;
+          import net.minecraft.world.level.block.state.BlockState;
+          import net.minecraft.world.level.storage.ValueInput;
+          import net.minecraft.world.level.storage.ValueOutput;
+
+          /**
+           * Sparse storage: only slots that actually hold something exist in the map,
+           * so the chest can have "infinite" slots at no cost until you fill them.
+           * Slot index = page * 54 + slotOnPage.
+           */
+          public class InfiniteChestBlockEntity extends BlockEntity implements MenuProvider {
+          	public static final int PAGE_SIZE = 54;
+
+          	public record Entry(long index, ItemStack stack) {
+          		public static final Codec<Entry> CODEC = RecordCodecBuilder.create(i -> i.group(
+          				Codec.LONG.fieldOf("index").forGetter(Entry::index),
+          				ItemStack.CODEC.fieldOf("stack").forGetter(Entry::stack)).apply(i, Entry::new));
+          		public static final Codec<List<Entry>> LIST_CODEC = CODEC.listOf();
+          	}
+
+          	private final Map<Long, ItemStack> items = new HashMap<>();
+
+          	public InfiniteChestBlockEntity(BlockPos pos, BlockState state) {
+          		super(InfiniteChestMod.INFINITE_CHEST_BE, pos, state);
+          	}
+
+          	public ItemStack get(long index) {
+          		return items.getOrDefault(index, ItemStack.EMPTY);
+          	}
+
+          	public void put(long index, ItemStack stack) {
+          		if (stack.isEmpty()) {
+          			items.remove(index);
+          		} else {
+          			items.put(index, stack);
+          		}
+          		setChanged();
+          	}
+
+          	public void purgeEmpty() {
+          		items.values().removeIf(ItemStack::isEmpty);
+          	}
+
+          	private List<Entry> toEntries() {
+          		purgeEmpty();
+          		List<Entry> list = new ArrayList<>(items.size());
+          		items.forEach((index, stack) -> list.add(new Entry(index, stack)));
+          		return list;
+          	}
+
+          	private void fromEntries(List<Entry> list) {
+          		items.clear();
+          		for (Entry e : list) {
+          			if (!e.stack().isEmpty()) {
+          				items.put(e.index(), e.stack());
+          			}
+          		}
+          	}
+
+          	@Override
+          	protected void saveAdditional(ValueOutput output) {
+          		super.saveAdditional(output);
+          		List<Entry> entries = toEntries();
+          		if (!entries.isEmpty()) {
+          			output.store("Items", Entry.LIST_CODEC, entries);
+          		}
+          	}
+
+          	@Override
+          	protected void loadAdditional(ValueInput input) {
+          		super.loadAdditional(input);
+          		items.clear();
+          		input.read("Items", Entry.LIST_CODEC).ifPresent(this::fromEntries);
+          	}
+
+          	// Lets the contents ride along on the dropped item (like a shulker box).
+          	@Override
+          	protected void collectImplicitComponents(DataComponentMap.Builder builder) {
+          		super.collectImplicitComponents(builder);
+          		List<Entry> entries = toEntries();
+          		if (!entries.isEmpty()) {
+          			builder.set(InfiniteChestMod.CONTENTS, entries);
+          		}
+          	}
+
+          	@Override
+          	protected void applyImplicitComponents(DataComponentGetter components) {
+          		super.applyImplicitComponents(components);
+          		List<Entry> entries = components.get(InfiniteChestMod.CONTENTS);
+          		if (entries != null) {
+          			fromEntries(entries);
+          		}
+          	}
+
+          	@Override
+          	public Component getDisplayName() {
+          		return Component.translatable("block.infinitechest.infinite_chest");
+          	}
+
+          	@Override
+          	public @Nullable AbstractContainerMenu createMenu(int containerId, Inventory inventory, Player player) {
+          		return new InfiniteChestMenu(containerId, inventory, new PagedView(this));
+          	}
+          }
+          EOF_1
+          mkdir -p src/main/java/com/example/infinitechest
+          cat > src/main/java/com/example/infinitechest/InfiniteChestClient.java <<'EOF_2'
+          package com.example.infinitechest;
+
+          import net.fabricmc.api.ClientModInitializer;
+          import net.minecraft.client.gui.screens.MenuScreens;
+
+          public class InfiniteChestClient implements ClientModInitializer {
+          	@Override
+          	public void onInitializeClient() {
+          		MenuScreens.register(InfiniteChestMod.INFINITE_CHEST_MENU, InfiniteChestScreen::new);
+          	}
+          }
+          EOF_2
+          mkdir -p src/main/java/com/example/infinitechest
+          cat > src/main/java/com/example/infinitechest/InfiniteChestMenu.java <<'EOF_3'
+          package com.example.infinitechest;
+
+          import org.jspecify.annotations.Nullable;
+
+          import net.minecraft.world.Container;
+          import net.minecraft.world.SimpleContainer;
+          import net.minecraft.world.entity.player.Inventory;
+          import net.minecraft.world.entity.player.Player;
+          import net.minecraft.world.inventory.AbstractContainerMenu;
+          import net.minecraft.world.inventory.DataSlot;
+          import net.minecraft.world.inventory.Slot;
+          import net.minecraft.world.item.ItemStack;
+
+          public class InfiniteChestMenu extends AbstractContainerMenu {
+          	private static final int SIZE = InfiniteChestBlockEntity.PAGE_SIZE; // 6 rows x 9
+          	private static final int MAX_PAGE = (1 << 30) - 1;
+
+          	private final Container container;
+          	private final @Nullable PagedView view; // server only
+
+          	// The page number is split over two synced values because menu data is sent as 16-bit shorts.
+          	private final DataSlot pageLow = DataSlot.standalone();
+          	private final DataSlot pageHigh = DataSlot.standalone();
+
+          	/** Client constructor. */
+          	public InfiniteChestMenu(int containerId, Inventory inventory) {
+          		this(containerId, inventory, new SimpleContainer(SIZE), null);
+          	}
+
+          	/** Server constructor. */
+          	public InfiniteChestMenu(int containerId, Inventory inventory, PagedView view) {
+          		this(containerId, inventory, view, view);
+          	}
+
+          	private InfiniteChestMenu(int containerId, Inventory inventory, Container container, @Nullable PagedView view) {
+          		super(InfiniteChestMod.INFINITE_CHEST_MENU, containerId);
+          		checkContainerSize(container, SIZE);
+          		this.container = container;
+          		this.view = view;
+          		addDataSlot(pageLow);
+          		addDataSlot(pageHigh);
+
+          		for (int row = 0; row < 6; row++) {
+          			for (int col = 0; col < 9; col++) {
+          				addSlot(new Slot(container, col + row * 9, 8 + col * 18, 18 + row * 18));
+          			}
+          		}
+          		for (int row = 0; row < 3; row++) {
+          			for (int col = 0; col < 9; col++) {
+          				addSlot(new Slot(inventory, col + row * 9 + 9, 8 + col * 18, 138 + row * 18));
+          			}
+          		}
+          		for (int col = 0; col < 9; col++) {
+          			addSlot(new Slot(inventory, col, 8 + col * 18, 196));
+          		}
+          	}
+
+          	public int getPage() {
+          		return (pageHigh.get() << 15) | pageLow.get();
+          	}
+
+          	private void setPage(int page) {
+          		page = Math.max(0, Math.min(MAX_PAGE, page));
+          		if (view != null) {
+          			view.setPage(page);
+          		}
+          		pageLow.set(page & 0x7FFF);
+          		pageHigh.set(page >> 15);
+          	}
+
+          	/** Button ids: 0 = -1 page, 1 = +1 page, 2 = -10 pages, 3 = +10 pages. */
+          	@Override
+          	public boolean clickMenuButton(Player player, int id) {
+          		if (view == null) {
+          			return false;
+          		}
+          		int delta = switch (id) {
+          			case 0 -> -1;
+          			case 1 -> 1;
+          			case 2 -> -10;
+          			case 3 -> 10;
+          			default -> 0;
+          		};
+          		if (delta == 0) {
+          			return false;
+          		}
+          		setPage(view.getPage() + delta);
+          		return true;
+          	}
+
+          	@Override
+          	public ItemStack quickMoveStack(Player player, int index) {
+          		ItemStack result = ItemStack.EMPTY;
+          		Slot slot = this.slots.get(index);
+          		if (slot.hasItem()) {
+          			ItemStack stack = slot.getItem();
+          			result = stack.copy();
+          			if (index < SIZE) {
+          				if (!moveItemStackTo(stack, SIZE, this.slots.size(), true)) {
+          					return ItemStack.EMPTY;
+          				}
+          			} else if (!moveItemStackTo(stack, 0, SIZE, false)) {
+          				return ItemStack.EMPTY;
+          			}
+          			if (stack.isEmpty()) {
+          				slot.setByPlayer(ItemStack.EMPTY);
+          			} else {
+          				slot.setChanged();
+          			}
+          		}
+          		return result;
+          	}
+
+          	@Override
+          	public void removed(Player player) {
+          		super.removed(player);
+          		if (view != null) {
+          			view.purge();
+          		}
+          	}
+
+          	@Override
+          	public boolean stillValid(Player player) {
+          		return container.stillValid(player);
+          	}
+          }
+          EOF_3
+          mkdir -p src/main/java/com/example/infinitechest
+          cat > src/main/java/com/example/infinitechest/InfiniteChestMod.java <<'EOF_4'
+          package com.example.infinitechest;
+
+          import java.util.List;
+          import java.util.Set;
+
+          import net.fabricmc.api.ModInitializer;
+          import net.minecraft.core.Registry;
+          import net.minecraft.core.component.DataComponentType;
+          import net.minecraft.core.registries.BuiltInRegistries;
+          import net.minecraft.core.registries.Registries;
+          import net.minecraft.resources.Identifier;
+          import net.minecraft.resources.ResourceKey;
+          import net.minecraft.world.flag.FeatureFlagSet;
+          import net.minecraft.world.inventory.MenuType;
+          import net.minecraft.world.item.BlockItem;
+          import net.minecraft.world.item.Item;
+          import net.minecraft.world.level.block.Block;
+          import net.minecraft.world.level.block.SoundType;
+          import net.minecraft.world.level.block.entity.BlockEntityType;
+          import net.minecraft.world.level.block.state.BlockBehaviour;
+
+          public class InfiniteChestMod implements ModInitializer {
+          	public static final String MOD_ID = "infinitechest";
+
+          	public static DataComponentType<List<InfiniteChestBlockEntity.Entry>> CONTENTS;
+          	public static Block INFINITE_CHEST;
+          	public static BlockEntityType<InfiniteChestBlockEntity> INFINITE_CHEST_BE;
+          	public static MenuType<InfiniteChestMenu> INFINITE_CHEST_MENU;
+
+          	public static Identifier id(String path) {
+          		return Identifier.fromNamespaceAndPath(MOD_ID, path);
+          	}
+
+          	@Override
+          	public void onInitialize() {
+          		// Item-side storage so the contents survive when the chest is broken.
+          		CONTENTS = Registry.register(BuiltInRegistries.DATA_COMPONENT_TYPE, id("contents"),
+          				DataComponentType.<List<InfiniteChestBlockEntity.Entry>>builder()
+          						.persistent(InfiniteChestBlockEntity.Entry.LIST_CODEC)
+          						.build());
+
+          		ResourceKey<Block> blockKey = ResourceKey.create(Registries.BLOCK, id("infinite_chest"));
+          		INFINITE_CHEST = Registry.register(BuiltInRegistries.BLOCK, blockKey,
+          				new InfiniteChestBlock(BlockBehaviour.Properties.of()
+          						.strength(2.5F)
+          						.sound(SoundType.WOOD)
+          						.setId(blockKey)));
+
+          		ResourceKey<Item> itemKey = ResourceKey.create(Registries.ITEM, id("infinite_chest"));
+          		Registry.register(BuiltInRegistries.ITEM, itemKey,
+          				new BlockItem(INFINITE_CHEST, new Item.Properties().setId(itemKey).useBlockDescriptionPrefix()));
+
+          		INFINITE_CHEST_BE = Registry.register(BuiltInRegistries.BLOCK_ENTITY_TYPE, id("infinite_chest"),
+          				new BlockEntityType<>(InfiniteChestBlockEntity::new, Set.of(INFINITE_CHEST)));
+
+          		INFINITE_CHEST_MENU = Registry.register(BuiltInRegistries.MENU, id("infinite_chest"),
+          				new MenuType<>(InfiniteChestMenu::new, FeatureFlagSet.of()));
+          	}
+          }
+          EOF_4
+          mkdir -p src/main/java/com/example/infinitechest
+          cat > src/main/java/com/example/infinitechest/InfiniteChestScreen.java <<'EOF_5'
+          package com.example.infinitechest;
+
+          import net.minecraft.client.gui.GuiGraphics;
+          import net.minecraft.client.gui.components.Button;
+          import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen;
+          import net.minecraft.client.renderer.RenderPipelines;
+          import net.minecraft.network.chat.Component;
+          import net.minecraft.resources.Identifier;
+          import net.minecraft.world.entity.player.Inventory;
+
+          public class InfiniteChestScreen extends AbstractContainerScreen<InfiniteChestMenu> {
+          	private static final Identifier TEXTURE = Identifier.withDefaultNamespace("textures/gui/container/generic_54.png");
+
+          	public InfiniteChestScreen(InfiniteChestMenu menu, Inventory inventory, Component title) {
+          		super(menu, inventory, title);
+          		this.imageHeight = 114 + 6 * 18;
+          		this.inventoryLabelY = this.imageHeight - 94;
+          	}
+
+          	@Override
+          	protected void init() {
+          		super.init();
+          		String[] labels = { "<<", "<", ">", ">>" };
+          		int[] ids = { 2, 0, 1, 3 };
+          		for (int i = 0; i < 4; i++) {
+          			final int buttonId = ids[i];
+          			addRenderableWidget(Button.builder(Component.literal(labels[i]), b -> press(buttonId))
+          					.bounds(this.leftPos + 100 + i * 17, this.topPos + 3, 16, 12)
+          					.build());
+          		}
+          	}
+
+          	private void press(int buttonId) {
+          		if (this.minecraft != null && this.minecraft.gameMode != null) {
+          			this.minecraft.gameMode.handleInventoryButtonClick(this.menu.containerId, buttonId);
+          		}
+          	}
+
+          	@Override
+          	public void render(GuiGraphics graphics, int mouseX, int mouseY, float partialTick) {
+          		super.render(graphics, mouseX, mouseY, partialTick);
+          		this.renderTooltip(graphics, mouseX, mouseY);
+          	}
+
+          	@Override
+          	protected void renderBg(GuiGraphics graphics, float partialTick, int mouseX, int mouseY) {
+          		graphics.blit(RenderPipelines.GUI_TEXTURED, TEXTURE, this.leftPos, this.topPos,
+          				0.0F, 0.0F, this.imageWidth, 6 * 18 + 17, 256, 256);
+          		graphics.blit(RenderPipelines.GUI_TEXTURED, TEXTURE, this.leftPos, this.topPos + 6 * 18 + 17,
+          				0.0F, 126.0F, this.imageWidth, 96, 256, 256);
+          	}
+
+          	@Override
+          	protected void renderLabels(GuiGraphics graphics, int mouseX, int mouseY) {
+          		super.renderLabels(graphics, mouseX, mouseY);
+          		Component text = Component.literal("Page " + (this.menu.getPage() + 1));
+          		int x = this.imageWidth - 8 - this.font.width(text);
+          		graphics.drawString(this.font, text, x, this.inventoryLabelY, 0xFF404040, false);
+          	}
+          }
+          EOF_5
+          mkdir -p src/main/java/com/example/infinitechest
+          cat > src/main/java/com/example/infinitechest/PagedView.java <<'EOF_6'
+          package com.example.infinitechest;
+
+          import net.minecraft.world.Container;
+          import net.minecraft.world.entity.player.Player;
+          import net.minecraft.world.item.ItemStack;
+
+          /** A 54-slot window onto one page of the infinite chest. */
+          public class PagedView implements Container {
+          	private final InfiniteChestBlockEntity chest;
+          	private int page;
+
+          	public PagedView(InfiniteChestBlockEntity chest) {
+          		this.chest = chest;
+          	}
+
+          	public int getPage() {
+          		return page;
+          	}
+
+          	public void setPage(int page) {
+          		this.page = page;
+          	}
+
+          	public void purge() {
+          		chest.purgeEmpty();
+          	}
+
+          	private long index(int slot) {
+          		return (long) page * InfiniteChestBlockEntity.PAGE_SIZE + slot;
+          	}
+
+          	@Override
+          	public int getContainerSize() {
+          		return InfiniteChestBlockEntity.PAGE_SIZE;
+          	}
+
+          	@Override
+          	public boolean isEmpty() {
+          		for (int i = 0; i < getContainerSize(); i++) {
+          			if (!getItem(i).isEmpty()) {
+          				return false;
+          			}
+          		}
+          		return true;
+          	}
+
+          	@Override
+          	public ItemStack getItem(int slot) {
+          		return chest.get(index(slot));
+          	}
+
+          	@Override
+          	public ItemStack removeItem(int slot, int amount) {
+          		ItemStack stack = chest.get(index(slot));
+          		if (stack.isEmpty() || amount <= 0) {
+          			return ItemStack.EMPTY;
+          		}
+          		ItemStack taken = stack.split(amount);
+          		chest.put(index(slot), stack); // removes the entry if now empty
+          		return taken;
+          	}
+
+          	@Override
+          	public ItemStack removeItemNoUpdate(int slot) {
+          		ItemStack stack = chest.get(index(slot));
+          		chest.put(index(slot), ItemStack.EMPTY);
+          		return stack;
+          	}
+
+          	@Override
+          	public void setItem(int slot, ItemStack stack) {
+          		chest.put(index(slot), stack);
+          	}
+
+          	@Override
+          	public void setChanged() {
+          		chest.setChanged();
+          	}
+
+          	@Override
+          	public boolean stillValid(Player player) {
+          		return Container.stillValidBlockEntity(chest, player);
+          	}
+
+          	@Override
+          	public void clearContent() {
+          		// Intentionally a no-op: never wipe an infinite chest by accident.
+          	}
+          }
+          EOF_6
+          mkdir -p src/main/resources/assets/infinitechest/blockstates
+          cat > src/main/resources/assets/infinitechest/blockstates/infinite_chest.json <<'EOF_7'
+          { "variants": { "": { "model": "infinitechest:block/infinite_chest" } } }
+          EOF_7
+          mkdir -p src/main/resources/assets/infinitechest/items
+          cat > src/main/resources/assets/infinitechest/items/infinite_chest.json <<'EOF_8'
+          { "model": { "type": "minecraft:model", "model": "infinitechest:block/infinite_chest" } }
+          EOF_8
+          mkdir -p src/main/resources/assets/infinitechest/lang
+          cat > src/main/resources/assets/infinitechest/lang/en_us.json <<'EOF_9'
+          { "block.infinitechest.infinite_chest": "Infinite Chest" }
+          EOF_9
+          mkdir -p src/main/resources/assets/infinitechest/models/block
+          cat > src/main/resources/assets/infinitechest/models/block/infinite_chest.json <<'EOF_10'
+          {
+            "parent": "minecraft:block/cube_bottom_top",
+            "textures": {
+              "top": "minecraft:block/barrel_top",
+              "bottom": "minecraft:block/barrel_bottom",
+              "side": "minecraft:block/barrel_side"
+            }
+          }
+          EOF_10
+          mkdir -p src/main/resources/data/infinitechest/loot_table/blocks
+          cat > src/main/resources/data/infinitechest/loot_table/blocks/infinite_chest.json <<'EOF_11'
+          {
+            "type": "minecraft:block",
+            "pools": [
+              {
+                "rolls": 1,
+                "conditions": [ { "condition": "minecraft:survives_explosion" } ],
+                "entries": [
+                  {
+                    "type": "minecraft:item",
+                    "name": "infinitechest:infinite_chest",
+                    "functions": [
+                      {
+                        "function": "minecraft:copy_components",
+                        "source": "block_entity",
+                        "include": [ "infinitechest:contents" ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ],
+            "random_sequence": "infinitechest:blocks/infinite_chest"
+          }
+          EOF_11
+          mkdir -p src/main/resources/data/infinitechest/recipe
+          cat > src/main/resources/data/infinitechest/recipe/infinite_chest.json <<'EOF_12'
+          {
+            "type": "minecraft:crafting_shaped",
+            "category": "misc",
+            "pattern": ["OEO", "ECE", "OEO"],
+            "key": {
+              "O": "minecraft:obsidian",
+              "E": "minecraft:ender_pearl",
+              "C": "minecraft:chest"
+            },
+            "result": { "id": "infinitechest:infinite_chest" }
+          }
+          EOF_12
+          mkdir -p src/main/resources/data/minecraft/tags/block/mineable
+          cat > src/main/resources/data/minecraft/tags/block/mineable/axe.json <<'EOF_13'
+          { "values": [ "infinitechest:infinite_chest" ] }
+          EOF_13
+          mkdir -p src/main/resources
+          cat > src/main/resources/fabric.mod.json <<'EOF_14'
+          {
+            "schemaVersion": 1,
+            "id": "infinitechest",
+            "version": "1.0.0",
+            "name": "Infinite Chest",
+            "description": "A chest with unlimited slots, browsed page by page.",
+            "authors": [],
+            "license": "CC0-1.0",
+            "environment": "*",
+            "entrypoints": {
+              "main": ["com.example.infinitechest.InfiniteChestMod"],
+              "client": ["com.example.infinitechest.InfiniteChestClient"]
+            },
+            "depends": {
+              "fabricloader": ">=0.19.5",
+              "minecraft": "~26.3",
+              "java": ">=25",
+              "fabric-api": "*"
+            }
+          }
+          EOF_14
+          # Target Minecraft 26.3
+          sed -i 's/^minecraft_version=.*/minecraft_version=26.3/' gradle.properties
+          sed -i 's/^loader_version=.*/loader_version=0.19.5/' gradle.properties
+          sed -i 's/^fabric_api_version=.*/fabric_api_version=0.161.0+26.3/' gradle.properties
+          # If the template splits client/common sources, move the client classes
+          if grep -q splitEnvironmentSourceSets build.gradle; then
+            mkdir -p src/client/java/com/example/infinitechest
+            mv src/main/java/com/example/infinitechest/InfiniteChestClient.java src/client/java/com/example/infinitechest/
+            mv src/main/java/com/example/infinitechest/InfiniteChestScreen.java src/client/java/com/example/infinitechest/
+          fi
+          cat gradle.properties
+
+      - name: Build
+        working-directory: proj
+        run: |
+          chmod +x gradlew
+          ./gradlew build --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: infinite-chest-jar
+          path: proj/build/libs/*.jar
